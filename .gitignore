@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+march_week3_dispatch.png
+*.egg-info/
+.env
