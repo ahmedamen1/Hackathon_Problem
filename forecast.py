@@ -393,10 +393,10 @@ p_sep_f = np.clip(model_final.predict(sep_2025[FEATURES].fillna(0)), 0, None)
 
 def print_metrics(label, y, p):
     print(f"\n{label}")
-    print(f"  RMSE           : {rmse(y,p):.4f} kW")
-    print(f"  MAE            : {mean_absolute_error(y,p):.4f} kW")
-    print(f"  NRMSE/(max-min): {nrmse_range(y,p)*100:.2f}%")
-    print(f"  NRMSE/mean     : {nrmse_mean(y,p)*100:.2f}%")
+    print(f"  RMSE       : {rmse(y,p):.4f} kW")
+    print(f"  MAE        : {mean_absolute_error(y,p):.4f} kW")
+    print(f"  NRMSE/mean : {nrmse_mean(y,p)*100:.2f}%")
+    print(f"  NRMSE/range: {nrmse_range(y,p)*100:.2f}%")
 
 print_metrics("April 2025",     y_true_apr, p_apr_f)
 print_metrics("September 2025", y_true_sep, p_sep_f)
@@ -405,6 +405,7 @@ comb_range = 0.5*(nrmse_range(y_true_apr,p_apr_f)+nrmse_range(y_true_sep,p_sep_f
 comb_mean  = 0.5*(nrmse_mean(y_true_apr,p_apr_f)+nrmse_mean(y_true_sep,p_sep_f))*100
 print(f"\nCombined NRMSE/(max-min): {comb_range:.2f}%")
 print(f"Combined NRMSE/mean     : {comb_mean:.2f}%")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BLOCK 7 — Save CSV + Plots
@@ -480,124 +481,133 @@ for month_name, feat_df, y_true, y_pred, color in [
     print(f"Saved {fname}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BLOCK 8 — Extra LightGBM with different seed + Random Forest ensemble
+# BLOCK 8 — Two-Model Day/Night with Optuna per segment
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
-print("BLOCK 8 — Extra LGB seeds + RF Ensemble")
+print("BLOCK 8 — Two-Model Day/Night (Optuna per segment)")
 print("=" * 60)
 
-from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
+def is_night(hour): return (hour < 6) or (hour >= 22)
 
-Xtr_fill = X_train.fillna(0).values
+night_tr = X_train['hour'].apply(is_night).values
+day_tr   = ~night_tr
+night_vl = X_val['hour'].apply(is_night).values
+day_vl   = ~night_vl
+
+Xtr_n, ytr_n, wtr_n = X_train[night_tr].values, y_train[night_tr].values, w_train[night_tr]
+Xtr_d, ytr_d, wtr_d = X_train[day_tr].values,   y_train[day_tr].values,   w_train[day_tr]
+Xvl_n, yvl_n        = X_val[night_vl].values,   y_val[night_vl].values
+Xvl_d, yvl_d        = X_val[day_vl].values,     y_val[day_vl].values
+
+print(f"Night train: {len(Xtr_n)}  Day train: {len(Xtr_d)}")
+
+def optuna_segment(Xtr, ytr, wtr, Xvl, yvl, n_trials, tag):
+    def obj(trial):
+        p = {
+            'objective': 'regression', 'metric': 'rmse',
+            'verbosity': -1, 'n_jobs': -1, 'seed': 42,
+            'feature_pre_filter': False,
+            'learning_rate':     trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'num_leaves':        trial.suggest_int('num_leaves', 16, 128),
+            'max_depth':         trial.suggest_int('max_depth', 3, 8),
+            'min_child_samples': trial.suggest_int('min_child_samples', 20, 300),
+            'subsample':         trial.suggest_float('subsample', 0.5, 1.0),
+            'colsample_bytree':  trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            'reg_alpha':         trial.suggest_float('reg_alpha', 0.0, 3.0),
+            'reg_lambda':        trial.suggest_float('reg_lambda', 0.0, 8.0),
+        }
+        _ds = lgb.Dataset(Xtr, label=ytr, weight=wtr, free_raw_data=False)
+        _dv = lgb.Dataset(Xvl, label=yvl, reference=_ds, free_raw_data=False)
+        m = lgb.train(p, _ds, num_boost_round=3000,
+                      valid_sets=[_dv], valid_names=['val'],
+                      callbacks=[lgb.early_stopping(100, verbose=False),
+                                 lgb.log_evaluation(-1)])
+        val_scores = m.best_score['val']
+        return val_scores.get('rmse', list(val_scores.values())[0])
+    s = optuna.create_study(direction='minimize')
+    s.optimize(obj, n_trials=n_trials, show_progress_bar=True)
+    print(f"{tag} best val RMSE: {s.best_value:.4f}  params: {s.best_params}")
+    return s.best_params
+
+print("Tuning NIGHT model (40 trials)...")
+best_n = optuna_segment(Xtr_n, ytr_n, wtr_n, Xvl_n, yvl_n, 40, "Night")
+print("Tuning DAY model (60 trials)...")
+best_d = optuna_segment(Xtr_d, ytr_d, wtr_d, Xvl_d, yvl_d, 60, "Day")
+
+def train_segment(Xtr, ytr, wtr, Xvl, yvl, params):
+    p = {'objective': 'regression', 'metric': 'rmse', 'verbosity': -1,
+         'n_jobs': -1, 'seed': 42, 'feature_pre_filter': False, **params}
+    ds = lgb.Dataset(Xtr, label=ytr, weight=wtr, free_raw_data=False)
+    dv = lgb.Dataset(Xvl, label=yvl, reference=ds, free_raw_data=False)
+    m = lgb.train(p, ds, num_boost_round=5000, valid_sets=[dv], valid_names=['val'],
+                  callbacks=[lgb.early_stopping(300, verbose=False),
+                             lgb.log_evaluation(-1)])
+    return m
+
+model_night = train_segment(Xtr_n, ytr_n, wtr_n, Xvl_n, yvl_n, best_n)
+model_day   = train_segment(Xtr_d, ytr_d, wtr_d, Xvl_d, yvl_d, best_d)
+print(f"Night best round: {model_night.best_iteration}  Day best round: {model_day.best_iteration}")
+
+def predict_dn(feat_df):
+    X = feat_df[FEATURES].fillna(0)
+    night_mask = feat_df['timestamp'].dt.hour.apply(is_night).values
+    out = np.zeros(len(feat_df))
+    if night_mask.any():
+        out[night_mask]  = model_night.predict(X[night_mask])
+    if (~night_mask).any():
+        out[~night_mask] = model_day.predict(X[~night_mask])
+    return np.clip(out, 0, None)
+
+p_apr_dn = predict_dn(apr_2025)
+p_sep_dn = predict_dn(sep_2025)
+print_metrics("April 2025 (day/night)",     y_true_apr, p_apr_dn)
+print_metrics("September 2025 (day/night)", y_true_sep, p_sep_dn)
+dn_mean = 0.5*(nrmse_mean(y_true_apr,p_apr_dn)+nrmse_mean(y_true_sep,p_sep_dn))*100
+print(f"Two-model Combined NRMSE/mean: {dn_mean:.2f}%")
+
+# ── Ensemble: blend single LGB + day/night ────────────────────────────────────
+def ensemble_rmse_fn(w, preds_list, y):
+    w = np.abs(np.array(w, dtype=float)); w /= w.sum()
+    return rmse(y, np.clip(sum(wi*pi for wi,pi in zip(w,preds_list)), 0, None))
+
 Xvl_fill = X_val.fillna(0).values
-X_apr_fill = apr_2025[FEATURES].fillna(0).values
-X_sep_fill = sep_2025[FEATURES].fillna(0).values
-
-# Train 2 more LGB models with different seeds for diversity
-extra_lgb_preds = []
-for seed in [7, 123]:
-    ep = {**final_params, 'seed': seed}
-    _ds = lgb.Dataset(X_train, label=y_train, weight=w_train, free_raw_data=False)
-    _dv = lgb.Dataset(X_val,   label=y_val,   reference=_ds, free_raw_data=False)
-    em = lgb.train(
-        ep, _ds, num_boost_round=5000,
-        valid_sets=[_dv],
-        callbacks=[lgb.early_stopping(300, verbose=False), lgb.log_evaluation(-1)],
-    )
-    extra_lgb_preds.append({
-        'apr': np.clip(em.predict(X_apr_fill), 0, None),
-        'sep': np.clip(em.predict(X_sep_fill), 0, None),
-        'val': np.clip(em.predict(Xvl_fill), 0, None),
-    })
-    print(f"LGB seed={seed} best round: {em.best_iteration}")
-
-# Random Forest (fast, sklearn)
-print("Training Random Forest...")
-rf = RandomForestRegressor(
-    n_estimators=300, max_depth=12, min_samples_leaf=20,
-    max_features=0.5, n_jobs=-1, random_state=42
-)
-rf.fit(Xtr_fill, y_train.values)
-p_apr_rf  = np.clip(rf.predict(X_apr_fill), 0, None)
-p_sep_rf  = np.clip(rf.predict(X_sep_fill), 0, None)
-pv_rf     = np.clip(rf.predict(Xvl_fill), 0, None)
-print_metrics("April 2025 (RF)",     y_true_apr, p_apr_rf)
-print_metrics("September 2025 (RF)", y_true_sep, p_sep_rf)
-rf_range = 0.5*(nrmse_range(y_true_apr,p_apr_rf)+nrmse_range(y_true_sep,p_sep_rf))*100
-print(f"RF Combined NRMSE/(max-min): {rf_range:.2f}%")
-
-# Extra Trees (diversifier)
-print("Training Extra Trees...")
-et = ExtraTreesRegressor(
-    n_estimators=300, max_depth=12, min_samples_leaf=20,
-    max_features=0.5, n_jobs=-1, random_state=42
-)
-et.fit(Xtr_fill, y_train.values)
-p_apr_et  = np.clip(et.predict(X_apr_fill), 0, None)
-p_sep_et  = np.clip(et.predict(X_sep_fill), 0, None)
-pv_et     = np.clip(et.predict(Xvl_fill), 0, None)
-print_metrics("April 2025 (ET)",     y_true_apr, p_apr_et)
-print_metrics("September 2025 (ET)", y_true_sep, p_sep_et)
-et_range = 0.5*(nrmse_range(y_true_apr,p_apr_et)+nrmse_range(y_true_sep,p_sep_et))*100
-print(f"ET Combined NRMSE/(max-min): {et_range:.2f}%")
-
-# ── Weighted ensemble ─────────────────────────────────────────────────────────
-def ensemble_rmse(w, preds_list, y):
-    w = np.abs(np.array(w)); w /= w.sum()
-    p = sum(wi * pi for wi, pi in zip(w, preds_list))
-    return rmse(y, np.clip(p, 0, None))
-
-pv_lgb   = np.clip(model_final.predict(Xvl_fill), 0, None)
-pv_lgb7  = extra_lgb_preds[0]['val']
-pv_lgb123= extra_lgb_preds[1]['val']
-
-all_pv   = [pv_lgb, pv_lgb7, pv_lgb123, pv_rf, pv_et]
-all_apr  = [p_apr_f, extra_lgb_preds[0]['apr'], extra_lgb_preds[1]['apr'], p_apr_rf, p_apr_et]
-all_sep  = [p_sep_f, extra_lgb_preds[0]['sep'], extra_lgb_preds[1]['sep'], p_sep_rf, p_sep_et]
-n_models = len(all_pv)
+pv_lgb = np.clip(model_final.predict(Xvl_fill), 0, None)
+# val preds for day/night model
+night_vl_mask = X_val['hour'].apply(is_night).values
+Xvl_all = X_val.fillna(0).values
+pv_dn = np.zeros(len(X_val))
+pv_dn[night_vl_mask]  = model_night.predict(Xvl_all[night_vl_mask])
+pv_dn[~night_vl_mask] = model_day.predict(Xvl_all[~night_vl_mask])
+pv_dn = np.clip(pv_dn, 0, None)
 
 from scipy.optimize import minimize as spmin
 res = spmin(
-    lambda w: ensemble_rmse(w, all_pv, y_val.values),
-    [1/n_models]*n_models, method='Nelder-Mead',
-    options={'maxiter': 10000, 'xatol': 1e-7, 'fatol': 1e-7}
+    lambda w: ensemble_rmse_fn(w, [pv_lgb, pv_dn], y_val.values),
+    [0.5, 0.5], method='Nelder-Mead',
+    options={'maxiter': 5000, 'xatol': 1e-7, 'fatol': 1e-7}
 )
 w_opt = np.abs(res.x); w_opt /= w_opt.sum()
-names = ['LGB42', 'LGB7', 'LGB123', 'RF', 'ET']
-print("\nOptimal weights:")
-for n, w in zip(names, w_opt): print(f"  {n}: {w:.3f}")
+print(f"\nEnsemble weights — LGB: {w_opt[0]:.3f}  DayNight: {w_opt[1]:.3f}")
 
-def blend(w, apr_list, sep_list):
-    w = np.abs(np.array(w, dtype=float)); w /= w.sum()
-    return (
-        np.clip(sum(wi*pi for wi,pi in zip(w,apr_list)), 0, None),
-        np.clip(sum(wi*pi for wi,pi in zip(w,sep_list)), 0, None),
-    )
+def blend2(w, a1, s1, a2, s2):
+    return (np.clip(w[0]*a1 + w[1]*a2, 0, None),
+            np.clip(w[0]*s1 + w[1]*s2, 0, None))
 
-# Simple equal average
-p_apr_avg, p_sep_avg = blend([1]*n_models, all_apr, all_sep)
-print_metrics("April 2025 (equal avg)",     y_true_apr, p_apr_avg)
-print_metrics("September 2025 (equal avg)", y_true_sep, p_sep_avg)
-avg_range = 0.5*(nrmse_range(y_true_apr,p_apr_avg)+nrmse_range(y_true_sep,p_sep_avg))*100
-print(f"Equal avg Combined NRMSE/(max-min): {avg_range:.2f}%")
+p_apr_ens, p_sep_ens = blend2(w_opt, p_apr_f, p_sep_f, p_apr_dn, p_sep_dn)
+print_metrics("April 2025 (ensemble)",     y_true_apr, p_apr_ens)
+print_metrics("September 2025 (ensemble)", y_true_sep, p_sep_ens)
+ens_mean = 0.5*(nrmse_mean(y_true_apr,p_apr_ens)+nrmse_mean(y_true_sep,p_sep_ens))*100
+print(f"Ensemble Combined NRMSE/mean: {ens_mean:.2f}%")
 
-# Optimal weighted
-p_apr_ens, p_sep_ens = blend(w_opt, all_apr, all_sep)
-print_metrics("April 2025 (weighted ens)",     y_true_apr, p_apr_ens)
-print_metrics("September 2025 (weighted ens)", y_true_sep, p_sep_ens)
-ens_range = 0.5*(nrmse_range(y_true_apr,p_apr_ens)+nrmse_range(y_true_sep,p_sep_ens))*100
-print(f"Weighted ens Combined NRMSE/(max-min): {ens_range:.2f}%")
-
-# Pick best
+# Pick best by NRMSE/mean
+single_mean = comb_mean
 all_results = [
-    ('LightGBM (Optuna)', p_apr_f,   p_sep_f,   comb_range),
-    ('RF',                p_apr_rf,  p_sep_rf,  rf_range),
-    ('ET',                p_apr_et,  p_sep_et,  et_range),
-    ('Equal avg',         p_apr_avg, p_sep_avg, avg_range),
-    ('Weighted ens',      p_apr_ens, p_sep_ens, ens_range),
+    ('LightGBM (Optuna)', p_apr_f,   p_sep_f,   single_mean),
+    ('Day/Night',         p_apr_dn,  p_sep_dn,  dn_mean),
+    ('Ensemble',          p_apr_ens, p_sep_ens, ens_mean),
 ]
 best_result = min(all_results, key=lambda x: x[3])
-print(f"\n*** Best: {best_result[0]}  Combined NRMSE/(max-min): {best_result[3]:.2f}% ***")
+print(f"\n*** Best: {best_result[0]}  Combined NRMSE/mean: {best_result[3]:.2f}% ***")
 p_apr_best, p_sep_best = best_result[1], best_result[2]
 
 # ══════════════════════════════════════════════════════════════════════════════
